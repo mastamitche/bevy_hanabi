@@ -1,9 +1,9 @@
-#import bevy_hanabi::vfx_common::{
+import bevy_hanabi::vfx_common::{
     ChildInfo, ChildInfoBuffer, DispatchIndirectArgs, SimParams, Spawner,
     EM_OFFSET_ALIVE_COUNT, EM_OFFSET_MAX_UPDATE, EM_OFFSET_CAPACITY,
     EM_OFFSET_MAX_SPAWN, EM_OFFSET_INDIRECT_DISPATCH_INDEX, DRAW_INDEXED_INDIRECT_STRIDE,
     EM_OFFSET_INDIRECT_WRITE_INDEX, EFFECT_METADATA_STRIDE
-}
+};
 
 @group(0) @binding(0) var<uniform> sim_params : SimParams;
 
@@ -19,9 +19,8 @@
 @group(2) @binding(0) var<storage, read_write> spawner_buffer : array<Spawner>;
 @group(2) @binding(1) var<storage, read_write> prefix_sum : array<u32>;
 
-#ifdef HAS_GPU_SPAWN_EVENTS
+@if(HAS_GPU_SPAWN_EVENTS)
 @group(3) @binding(0) var<storage, read_write> child_info_buffer : ChildInfoBuffer;
-#endif
 
 /// Perform per-instance update between the init and update passes.
 ///
@@ -36,7 +35,7 @@ fn main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
         return;
     }
 
-#ifdef HAS_GPU_SPAWN_EVENTS
+    @if(HAS_GPU_SPAWN_EVENTS) {
     // Clear any GPU event. The indexing is inconsistent here (indexing child info buffer with an
     // effect instance), but is safe because there are always less child effects than there are effects
     // in total, so the index will always cover the entire child info array. And we're only resetting
@@ -44,7 +43,7 @@ fn main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     if (global_effect_index < arrayLength(&child_info_buffer.rows)) {
         child_info_buffer.rows[global_effect_index].event_count = 0;
     }
-#endif
+    }
 
     let spawner = &spawner_buffer[global_effect_index];
 

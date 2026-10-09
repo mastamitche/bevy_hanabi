@@ -185,7 +185,7 @@ use bevy::{
     camera::visibility::VisibilityClass,
     platform::collections::{HashMap, HashSet},
     prelude::*,
-    render::{extract_component::ExtractComponent, sync_world::SyncToRenderWorld},
+    render::{extract_component::ExtractComponent, sync_world::SyncToRenderWorld, RenderApp},
 };
 use rand::{RngExt as _, SeedableRng as _};
 use serde::{Deserialize, Serialize};
@@ -579,6 +579,7 @@ impl From<&PropertyInstance> for PropertyValue {
 
 /// The [`VisibilityClass`] used for all particle effects.
 #[derive(Default, Clone, Copy, Component, ExtractComponent)]
+#[extract_app(RenderApp)]
 pub struct EffectVisibilityClass;
 
 /// Particle-based visual effect instance.
@@ -858,9 +859,14 @@ impl EffectShaderSources {
         // Generate the WGSL code declaring all the attributes inside the Particle
         // struct.
         let attributes_code = particle_layout.generate_code();
+        // Note: the WESL compiler parses the entire shader template before evaluating
+        // the conditional compilation attributes (`@if`), so code excluded by those
+        // attributes must still be syntactically valid. A struct must have at least
+        // one member, so insert a placeholder one if there's no parent; the struct
+        // itself is excluded from the final shader in that case.
         let parent_attributes_code = parent_layout
             .map(|layout| layout.generate_code())
-            .unwrap_or_default();
+            .unwrap_or_else(|| "    unused: u32,\n".to_string());
 
         // For the renderer, assign all its inputs to the values of the attributes
         // present, or a default value.
@@ -1176,7 +1182,8 @@ fn append_spawn_events_{0}(base_child_index: u32, particle_index: u32, count: u3
                     return 0_f32.to_wgsl_string();
                 })
             } else {
-                String::new()
+                // Unused, but must be valid WGSL for the WESL parser.
+                1_f32.to_wgsl_string()
             };
 
             let (flipbook_scale_code, flipbook_row_count_code) = if let Some(grid_size) =
@@ -1189,7 +1196,8 @@ fn append_spawn_events_{0}(base_child_index: u32, particle_index: u32, count: u3
                     Vec2::new(1.0 / grid_size.x as f32, 1.0 / grid_size.y as f32).to_wgsl_string();
                 (flipbook_scale_code, flipbook_row_count_code)
             } else {
-                (String::new(), String::new())
+                // Unused, but must be valid WGSL for the WESL parser.
+                (Vec2::ONE.to_wgsl_string(), 1_i32.to_wgsl_string())
             };
 
             trace!(
@@ -1554,9 +1562,9 @@ impl CompiledParticleEffect {
     }
 }
 
-const PARTICLES_INIT_SHADER_TEMPLATE: &str = include_str!("render/vfx_init.wgsl");
-const PARTICLES_UPDATE_SHADER_TEMPLATE: &str = include_str!("render/vfx_update.wgsl");
-const PARTICLES_RENDER_SHADER_TEMPLATE: &str = include_str!("render/vfx_render.wgsl");
+const PARTICLES_INIT_SHADER_TEMPLATE: &str = include_str!("render/vfx_init.wesl");
+const PARTICLES_UPDATE_SHADER_TEMPLATE: &str = include_str!("render/vfx_update.wesl");
+const PARTICLES_RENDER_SHADER_TEMPLATE: &str = include_str!("render/vfx_render.wesl");
 
 /// Trait to convert any data structure to its equivalent shader code.
 trait ShaderCode {
@@ -1875,19 +1883,18 @@ fn update_properties_from_asset(
 mod tests {
     use std::ops::DerefMut;
 
+    use bevy::shader::ShaderDefVal;
     use bevy::{
         asset::{
             io::{
                 memory::{Dir, MemoryAssetReader},
                 AssetSourceBuilder, AssetSourceBuilders, AssetSourceId,
             },
-            AssetServerMode, LoadState, UnapprovedPathMode,
+            AssetServerMode, UnapprovedPathMode,
         },
         camera::visibility::{VisibilityPlugin, VisibilitySystems},
-        shader::ShaderLoader,
         tasks::{IoTaskPool, TaskPoolBuilder},
     };
-    use naga_oil::compose::{Composer, NagaModuleDescriptor, ShaderDefValue};
 
     use super::*;
     use crate::spawn::new_rng;
@@ -2184,6 +2191,7 @@ else { return c1; }
         let res = EffectShaderSources::generate(&asset, None, 0);
         assert!(res.is_ok());
         let shader_source = res.unwrap();
+        let view_shader = load_view_shader();
         for (name, code) in [
             ("Init", shader_source.init_shader_source),
             ("Update", shader_source.update_shader_source),
@@ -2191,119 +2199,168 @@ else { return c1; }
         ] {
             println!("{} shader:\n\n{}", name, code);
 
-            let mut shader_defs = std::collections::HashMap::<String, ShaderDefValue>::new();
-            shader_defs.insert("LOCAL_SPACE_SIMULATION".into(), ShaderDefValue::Bool(true));
-            shader_defs.insert("NEEDS_UV".into(), ShaderDefValue::Bool(true));
-            shader_defs.insert("NEEDS_NORMAL".into(), ShaderDefValue::Bool(false));
-            shader_defs.insert(
-                "NEEDS_PARTICLE_FRAGMENT".into(),
-                ShaderDefValue::Bool(false),
-            );
-            shader_defs.insert(
+            let mut shader_defs: Vec<ShaderDefVal> = vec![
+                "LOCAL_SPACE_SIMULATION".into(),
+                "NEEDS_UV".into(),
+                ShaderDefVal::Bool("NEEDS_NORMAL".into(), false),
+                ShaderDefVal::Bool("NEEDS_PARTICLE_FRAGMENT".into(), false),
                 "PARTICLE_SCREEN_SPACE_SIZE".into(),
-                ShaderDefValue::Bool(true),
-            );
+            ];
             if name == "Update" {
-                shader_defs.insert("EM_MAX_SPAWN_ATOMIC".into(), ShaderDefValue::Bool(true));
+                shader_defs.push("EM_MAX_SPAWN_ATOMIC".into());
             }
-            let mut composer = Composer::default();
+            let shader = Shader::from_wesl(code.clone(), format!("hanabi/test_{name}.wesl"));
+            compose_and_validate(&view_shader, shader, &shader_defs);
 
-            // Import bevy_render::view for the render shader
-            {
-                // It's reasonably hard to retrieve the source code for view.wgsl in
-                // bevy_render. We use a few tricks to get a Shader that we can
-                // then convert into a composable module (which is how imports work in Bevy
-                // itself).
-                IoTaskPool::get_or_init(|| {
-                    TaskPoolBuilder::default()
-                        .num_threads(1)
-                        .thread_name("Hanabi test IO Task Pool".to_string())
-                        .build()
-                });
-                let mut dummy_app = App::new();
-                dummy_app.add_plugins(bevy::asset::AssetPlugin::default());
-                dummy_app
-                    .init_asset::<Shader>()
-                    .init_asset_loader::<ShaderLoader>();
-                dummy_app.add_plugins(bevy::render::view::ViewPlugin);
-                let asset_server = dummy_app.world().resource::<AssetServer>();
-                let view_shader_handle =
-                    asset_server.load::<Shader>("embedded://bevy_render/view/view.wgsl");
+            // Also check some other combinations of shader defs, to make sure all
+            // conditional branches of the templates produce valid code.
+            let other_shader_defs: Vec<ShaderDefVal> = match name {
+                "Init" => vec![],
+                "Update" => vec![
+                    "EMITS_GPU_SPAWN_EVENTS".into(),
+                    "CHILD_INFO_EVENT_COUNT_IS_ATOMIC".into(),
+                ],
+                _ => vec![
+                    "NEEDS_NORMAL".into(),
+                    "NEEDS_PARTICLE_FRAGMENT".into(),
+                    "USE_ALPHA_MASK".into(),
+                ],
+            };
+            let shader = Shader::from_wesl(code, format!("hanabi/test_{name}_other.wesl"));
+            compose_and_validate(&view_shader, shader, &other_shader_defs);
+        }
 
-                // Need at least one frame tick for the loaded asset to send a message to the
-                // asset server to get registered
-                let mut max_frames = 10000; // it takes a decent amount of time to load async the asset, even if embedded
-                while max_frames > 0 {
-                    dummy_app.update();
+        // Also validate the fixed (non-generated) shaders, with all their variants.
+        let min_storage_buffer_offset_alignment = 256;
+        for (shader, shader_defs) in [
+            (
+                HanabiPlugin::make_indirect_shader(min_storage_buffer_offset_alignment, false),
+                vec![],
+            ),
+            (
+                HanabiPlugin::make_indirect_shader(min_storage_buffer_offset_alignment, true),
+                vec!["HAS_GPU_SPAWN_EVENTS".into()],
+            ),
+            (HanabiPlugin::make_prefix_sum_shader(), vec![]),
+            (
+                Shader::from_wesl(
+                    crate::plugin::VFX_SORT_WESL,
+                    "embedded://bevy_hanabi/vfx_sort.wesl",
+                ),
+                vec![],
+            ),
+            (
+                Shader::from_wesl(
+                    crate::plugin::VFX_SORT_WESL,
+                    "embedded://bevy_hanabi/vfx_sort.wesl",
+                ),
+                vec!["HAS_DUAL_KEY".into()],
+            ),
+            (
+                Shader::from_wesl(
+                    include_str!("render/vfx_sort_fill.wesl"),
+                    "embedded://bevy_hanabi/vfx_sort_fill.wesl",
+                ),
+                vec![],
+            ),
+            (
+                Shader::from_wesl(
+                    include_str!("render/vfx_sort_copy.wesl"),
+                    "embedded://bevy_hanabi/vfx_sort_copy.wesl",
+                ),
+                vec![],
+            ),
+        ] {
+            compose_and_validate(&view_shader, shader, &shader_defs);
+        }
+    }
 
-                    let asset_server = dummy_app.world().resource::<AssetServer>();
-                    let load_state = asset_server.get_load_state(&view_shader_handle).unwrap();
-                    if let LoadState::Failed(err) = load_state {
-                        panic!("Load failed: {:?}", err);
-                    }
-                    if matches!(load_state, LoadState::Loaded) {
-                        break;
-                    }
-
-                    max_frames -= 1;
+    /// Load the `bevy_render::view` shader module, which is imported by the
+    /// render shader.
+    fn load_view_shader() -> Shader {
+        IoTaskPool::get_or_init(|| {
+            TaskPoolBuilder::default()
+                .num_threads(1)
+                .thread_name("Hanabi test IO Task Pool".to_string())
+                .build()
+        });
+        let mut dummy_app = App::new();
+        dummy_app.add_plugins((
+            bevy::asset::AssetPlugin::default(),
+            bevy::window::WindowPlugin {
+                primary_window: None,
+                ..default()
+            },
+            // The view shader is embedded by the RenderPlugin. Disable all backends so
+            // that the plugin doesn't try to create an actual renderer.
+            bevy::render::RenderPlugin {
+                render_creation: bevy::render::settings::WgpuSettings {
+                    backends: None,
+                    ..default()
                 }
-                assert!(max_frames > 0);
+                .into(),
+                ..default()
+            },
+        ));
+        // Read the source directly from the embedded asset source, without running the
+        // app (and its render systems), then create the shader the same way the
+        // ShaderLoader does.
+        let asset_server = dummy_app.world().resource::<AssetServer>();
+        let source = asset_server
+            .get_source(AssetSourceId::Name("embedded".into()))
+            .unwrap();
+        let mut bytes = Vec::new();
+        futures::executor::block_on(async {
+            let mut reader = source
+                .reader()
+                .read(std::path::Path::new("bevy_render/view.wesl"))
+                .await
+                .unwrap();
+            reader.read_to_end(&mut bytes).await.unwrap();
+        });
+        Shader::from_wesl(
+            String::from_utf8(bytes).unwrap(),
+            "embedded://bevy_render/view.wesl",
+        )
+    }
 
-                let shaders = dummy_app.world().get_resource::<Assets<Shader>>().unwrap();
-                for (id, shader) in shaders.iter() {
-                    println!("[{id:?}] {shader:?}");
-                }
-                let view_shader = shaders.get(&view_shader_handle).unwrap();
-
-                let res = composer.add_composable_module(view_shader.into());
-                assert!(res.is_ok());
-            }
-
-            // Import bevy_hanabi::vfx_common
-            {
-                let min_storage_buffer_offset_alignment = 256;
-                let common_shader =
-                    HanabiPlugin::make_common_shader(min_storage_buffer_offset_alignment);
-                let res = composer.add_composable_module((&common_shader).into());
-                assert!(res.is_ok());
-            }
-
-            match composer.make_naga_module(NagaModuleDescriptor {
-                source: &code[..],
-                file_path: &format!("{}.wgsl", name),
-                shader_defs,
-                ..Default::default()
-            }) {
-                Ok(module) => {
-                    // println!("shader: {:#?}", module);
-                    let info = naga::valid::Validator::new(
-                        naga::valid::ValidationFlags::all(),
-                        naga::valid::Capabilities::default(),
-                    )
-                    .validate(&module)
-                    .unwrap();
-                    let wgsl = naga::back::wgsl::write_string(
-                        &module,
-                        &info,
-                        naga::back::wgsl::WriterFlags::EXPLICIT_TYPES,
-                    )
-                    .unwrap();
-                    println!("Final wgsl from naga:\n\n{}", wgsl);
-                    // Ok(module)
-                }
-                Err(e) => {
-                    panic!("{}", e.emit_to_string(&composer));
-                    // Err(e)
-                }
-            }
-
-            // let mut frontend = Frontend::new();
-            // let res = frontend.parse(code);
-            // if let Err(err) = &res {
-            //     println!("{} code: {}", name, code);
-            //     println!("Err: {:?}", err);
-            // }
-            // assert!(res.is_ok());
+    /// Compose a WESL shader with its imports and the given shader defs, then
+    /// validate the resulting WGSL code with naga.
+    fn compose_and_validate(view_shader: &Shader, shader: Shader, shader_defs: &[ShaderDefVal]) {
+        let mut cache: bevy::shader::ShaderCache<String, ()> =
+            bevy::shader::ShaderCache::new((), |_, source, _| match source {
+                bevy::shader::ShaderCacheSource::Wgsl(wgsl) => Ok(wgsl),
+                _ => panic!("Expected WGSL output from shader composition."),
+            });
+        let id = |n: u128| AssetId::<Shader>::Uuid {
+            uuid: bevy::asset::uuid::Uuid::from_u128(n),
+        };
+        cache.set_shader(id(1), view_shader.clone());
+        cache.set_shader(id(2), HanabiPlugin::make_common_shader(256));
+        let path = shader.path.clone();
+        cache.set_shader(id(3), shader);
+        let wgsl = match cache.get(0, id(3), shader_defs) {
+            Ok(wgsl) => wgsl,
+            Err(err) => panic!("Failed to compose shader {path} with defs {shader_defs:?}: {err}"),
+        };
+        println!("Final WGSL for {path} with defs {shader_defs:?}:\n\n{wgsl}");
+        let module = match naga::front::wgsl::parse_str(&wgsl) {
+            Ok(module) => module,
+            Err(err) => panic!(
+                "Failed to parse shader {path} with defs {shader_defs:?}: {}",
+                err.emit_to_string(&wgsl)
+            ),
+        };
+        if let Err(err) = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::default(),
+        )
+        .validate(&module)
+        {
+            panic!(
+                "Failed to validate shader {path} with defs {shader_defs:?}: {}",
+                err.emit_to_string(&wgsl)
+            );
         }
     }
 

@@ -166,6 +166,7 @@ impl SortBindGroups {
             entry_point: Some("main".into()),
             immediate_size: 0,
             zero_initialize_workgroup_memory: false,
+            constants: vec![],
         });
 
         let alignment = render_device.limits().min_storage_buffer_offset_alignment;
@@ -200,6 +201,7 @@ impl SortBindGroups {
                 entry_point: Some("main".into()),
                 immediate_size: 0,
                 zero_initialize_workgroup_memory: false,
+                constants: vec![],
             });
 
         Self {
@@ -370,6 +372,7 @@ impl SortBindGroups {
                         entry_point: Some("main".into()),
                         immediate_size: 0,
                         zero_initialize_workgroup_memory: false,
+                        constants: vec![],
                     });
                 (bind_group_layout_desc, pipeline_id)
             });

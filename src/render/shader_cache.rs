@@ -11,12 +11,13 @@ use bevy::{
 /// Cache of baked shaders variants.
 ///
 /// Baked shader variants are shaders where the placeholders `{{PLACEHOLDER}}`
-/// present in the WGSL template code have been replaced by actual WGSL code,
+/// present in the WESL template code have been replaced by actual WGSL code,
 /// making them a valid shader from the point of view of the Bevy renderer.
 ///
 /// Shaders present in the cache are allocated [`Shader`] resources. Note that a
-/// [`Shader`] resource _may_ further be preprocessed to replace `#define`
-/// directives; to this extent, some entries may not be compilable WGSL as is.
+/// [`Shader`] resource is further preprocessed by the WESL compiler to resolve
+/// imports and conditional compilation attributes (`@if`); to this extent,
+/// entries are not compilable WGSL as is.
 #[derive(Default, Resource)]
 pub struct ShaderCache {
     /// Map of allocated shader resources from their baked shader code.
@@ -39,9 +40,15 @@ impl ShaderCache {
             handle.clone()
         } else {
             let hash = bevy::platform::hash::FixedHasher.hash_one(source);
-            let shader = Shader::from_wgsl(
+            // The path determines the WESL module path of the shader, so restrict it to
+            // characters valid in an identifier. It's otherwise only used for debugging.
+            let filename: String = filename
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            let shader = Shader::from_wesl(
                 source.to_string(),
-                format!("hanabi/{}_{}_{}.wgsl", filename, suffix, hash),
+                format!("hanabi/{}_{}_{}.wesl", filename, suffix, hash),
             );
             trace!(
                 "Shader path={} import_path={:?} imports={:?}",

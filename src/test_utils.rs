@@ -2,7 +2,7 @@ use std::ops::Sub;
 
 use bevy::prelude::{Quat, Vec2, Vec3, Vec4};
 #[cfg(feature = "gpu_tests")]
-use bevy::render::renderer::{RenderDevice, RenderQueue, WgpuWrapper};
+use bevy::render::renderer::{RenderDevice, RenderQueue};
 
 /// Utility trait to compare floating-point values with a tolerance.
 pub(crate) trait AbsDiffEq {
@@ -166,6 +166,7 @@ impl MockRenderer {
                 power_preference: wgpu::PowerPreference::default(),
                 force_fallback_adapter: false,
                 compatible_surface: None,
+                apply_limit_buckets: false,
             }))
             .expect("Failed to find an appropriate adapter");
 
@@ -184,7 +185,7 @@ impl MockRenderer {
 
         // Turn into Bevy objects
         let device = RenderDevice::from(device);
-        let queue = RenderQueue(std::sync::Arc::new(WgpuWrapper::new(queue)));
+        let queue = RenderQueue::new(queue);
 
         Self {
             instance,
